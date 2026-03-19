@@ -4,62 +4,6 @@ import { api } from "../../../scripts/api.js";
 // ── Constants ────────────────────────────────────────────────────────────
 const BRUSH_SIZE_KEY = "comfy_sketch_brush_size";
 
-// ── Flood-fill utility (scanline-based) ──────────────────────────────────
-function floodFill(ctx, startX, startY, fillR, fillG, fillB, fillA, width, height) {
-    const imageData = ctx.getImageData(0, 0, width, height);
-    const data = imageData.data;
-
-    const startIdx = (startY * width + startX) * 4;
-    const targetR = data[startIdx];
-    const targetG = data[startIdx + 1];
-    const targetB = data[startIdx + 2];
-    const targetA = data[startIdx + 3];
-
-    if (targetR === fillR && targetG === fillG && targetB === fillB && targetA === fillA) return;
-
-    const tolerance = 30;
-    function matches(idx) {
-        return (
-            Math.abs(data[idx] - targetR) <= tolerance &&
-            Math.abs(data[idx + 1] - targetG) <= tolerance &&
-            Math.abs(data[idx + 2] - targetB) <= tolerance &&
-            Math.abs(data[idx + 3] - targetA) <= tolerance
-        );
-    }
-
-    const stack = [[startX, startY]];
-    const visited = new Uint8Array(width * height);
-
-    while (stack.length > 0) {
-        const [x, y] = stack.pop();
-        let idx = y * width + x;
-
-        if (x < 0 || x >= width || y < 0 || y >= height) continue;
-        if (visited[idx]) continue;
-
-        const pixelIdx = idx * 4;
-        if (!matches(pixelIdx)) continue;
-
-        visited[idx] = 1;
-        data[pixelIdx] = fillR;
-        data[pixelIdx + 1] = fillG;
-        data[pixelIdx + 2] = fillB;
-        data[pixelIdx + 3] = fillA;
-
-        stack.push([x + 1, y], [x - 1, y], [x, y + 1], [x, y - 1]);
-    }
-
-    ctx.putImageData(imageData, 0, 0);
-}
-
-function hexToRgb(hex) {
-    return {
-        r: parseInt(hex.slice(1, 3), 16),
-        g: parseInt(hex.slice(3, 5), 16),
-        b: parseInt(hex.slice(5, 7), 16),
-    };
-}
-
 // ── Snapshot helpers ─────────────────────────────────────────────────────
 function saveSnapshot(state, drawCanvas) {
     state.undoStack.push(drawCanvas.toDataURL());
@@ -98,7 +42,7 @@ app.registerExtension({
         const state = {
             currentColor: "#FF0000",
             brushSize: savedBrush ? parseInt(savedBrush) : 8,
-            tool: "brush",       // brush | eraser | fill | line
+            tool: "brush",       // brush | eraser | line
             isDrawing: false,
             undoStack: [],
             redoStack: [],
@@ -112,16 +56,25 @@ app.registerExtension({
             panY: 0,
             _bgImage: null,
             // Line / polyline tool
-            lineStart: null,     // {x, y} in image coords — anchor for next segment
-            lineCurrent: null,   // {x, y} in image coords — live cursor position
+            lineStart: null,
+            lineCurrent: null,
             // Shift+click straight line
             lastBrushPoint: null,
-            // Paste toggle (alternate filenames)
+            // Paste toggle
             _pasteToggle: false,
             // Info label ref
             _infoLabel: null,
             // Min height for widget
             _minHeight: 340,
+            // Lazy mouse
+            lazyEnabled: true,
+            lazyRadius: 60,
+            _lazyX: 0,
+            _lazyY: 0,
+            _lazyCursorX: 0,
+            _lazyCursorY: 0,
+            _lazyActive: false,
+            _lazyRafId: null,
         };
 
         // ── Offscreen draw canvas (native image resolution) ──
@@ -194,24 +147,27 @@ app.registerExtension({
         toolbar.appendChild(sep());
 
         // ── Tool buttons ──
+        const drawBtn = makeBtn("Draw", "Freehand brush (return from line mode)", () => {
+            state.tool = "brush";
+            endPolyline();
+            highlightActive();
+        });
+        // Fit placed here — left of Eraser
+        const fitBtn = makeBtn("Fit", "Zoom to fit image in view", () => fitToView());
         const eraserBtn = makeBtn("E", "Eraser", () => {
             state.tool = "eraser";
             endPolyline();
             highlightActive();
         });
-        const fillBtn = makeBtn("Fill", "Flood fill", () => {
-            state.tool = "fill";
-            endPolyline();
-            highlightActive();
-        });
-        const lineBtn = makeBtn("Line", "Straight line / polyline (click to place points, Escape to finish)", () => {
+        const lineBtn = makeBtn("Line", "Polyline (left-click points, right-click to finish)", () => {
             state.tool = "line";
             state.lineStart = null;
             state.lineCurrent = null;
             highlightActive();
         });
+        toolbar.appendChild(drawBtn);
+        toolbar.appendChild(fitBtn);
         toolbar.appendChild(eraserBtn);
-        toolbar.appendChild(fillBtn);
         toolbar.appendChild(lineBtn);
         toolbar.appendChild(sep());
 
@@ -234,6 +190,27 @@ app.registerExtension({
             localStorage.setItem(BRUSH_SIZE_KEY, String(state.brushSize));
         };
         toolbar.appendChild(sizeSlider);
+
+        // ── Lazy mouse ──
+        const lazyLabel = document.createElement("span");
+        lazyLabel.textContent = "Lazy:";
+        lazyLabel.style.cssText = "color:#aaa; font-size:10px; margin-left:4px;";
+        toolbar.appendChild(lazyLabel);
+
+        const lazySlider = document.createElement("input");
+        lazySlider.type = "range";
+        lazySlider.min = "0";
+        lazySlider.max = "60";
+        lazySlider.value = "60";
+        lazySlider.title = "Lazy mouse radius (0 = off, higher = smoother/laggier)";
+        lazySlider.style.cssText = "width:45px; height:14px; cursor:pointer;";
+        lazySlider.addEventListener("mousedown", (e) => e.stopPropagation());
+        lazySlider.oninput = (e) => {
+            e.stopPropagation();
+            state.lazyRadius = parseInt(e.target.value);
+            state.lazyEnabled = state.lazyRadius > 0;
+        };
+        toolbar.appendChild(lazySlider);
         toolbar.appendChild(sep());
 
         // ── Undo / Redo / Clear ──
@@ -257,9 +234,12 @@ app.registerExtension({
         pasteBtn.addEventListener("mouseleave", () => { pasteBtn.style.background = "#2a3a5a"; });
         toolbar.appendChild(pasteBtn);
 
-        // ── Fit button ──
-        const fitBtn = makeBtn("Fit", "Zoom to fit image in view", () => fitToView());
-        toolbar.appendChild(fitBtn);
+        const copyBtn = makeBtn("Copy", "Copy composite to clipboard (Ctrl+C)", () => copyToClipboard());
+        copyBtn.style.background = "#2a3a5a";
+        copyBtn.style.color = "#8cf";
+        copyBtn.addEventListener("mouseenter", () => { copyBtn.style.background = "#3a5a7a"; });
+        copyBtn.addEventListener("mouseleave", () => { copyBtn.style.background = "#2a3a5a"; });
+        toolbar.appendChild(copyBtn);
         toolbar.appendChild(sep());
 
         // ── Info label ──
@@ -427,8 +407,8 @@ app.registerExtension({
                 const isActive = state.tool === "brush" && state.currentColor === colors[i].color;
                 b.style.border = isActive ? "2px solid #fff" : "2px solid transparent";
             });
+            drawBtn.style.border = state.tool === "brush" ? "2px solid #fff" : "2px solid transparent";
             eraserBtn.style.border = state.tool === "eraser" ? "2px solid #fff" : "2px solid transparent";
-            fillBtn.style.border = state.tool === "fill" ? "2px solid #fff" : "2px solid transparent";
             lineBtn.style.border = state.tool === "line" ? "2px solid #fff" : "2px solid transparent";
         }
         highlightActive();
@@ -454,33 +434,25 @@ app.registerExtension({
                 return;
             }
 
-            // Only left click for tools
+            // Right-click: end polyline (line tool only)
+            if (e.button === 2) {
+                if (state.tool === "line") endPolyline();
+                return;
+            }
+
+            // Only left click for remaining tools
             if (e.button !== 0) return;
 
             const raw = toImageCoords(e);
             const pos = clampToImage(raw);
 
-            // ── Fill tool ──
-            if (state.tool === "fill") {
-                if (pos.x < 0 || pos.x >= state.imageWidth || pos.y < 0 || pos.y >= state.imageHeight) return;
-                saveSnapshot(state, drawCanvas);
-                const rgb = hexToRgb(state.currentColor);
-                floodFill(drawCtx, Math.round(pos.x), Math.round(pos.y),
-                    rgb.r, rgb.g, rgb.b, 255,
-                    drawCanvas.width, drawCanvas.height);
-                redraw();
-                return;
-            }
-
             // ── Line tool ──
             if (state.tool === "line") {
                 if (!state.lineStart) {
-                    // First click: set anchor
                     state.lineStart = pos;
                     state.lineCurrent = pos;
                     redraw();
                 } else {
-                    // Subsequent click: draw segment, move anchor
                     saveSnapshot(state, drawCanvas);
                     drawCtx.beginPath();
                     drawCtx.moveTo(state.lineStart.x, state.lineStart.y);
@@ -533,6 +505,16 @@ app.registerExtension({
             }
             drawCtx.lineWidth = state.brushSize;
             state.lastBrushPoint = pos;
+
+            // Lazy mouse: initialise position and start RAF loop
+            if (state.lazyEnabled && state.tool === "brush") {
+                state._lazyX = pos.x;
+                state._lazyY = pos.y;
+                state._lazyCursorX = pos.x;
+                state._lazyCursorY = pos.y;
+                state._lazyActive = true;
+                state._lazyRafId = requestAnimationFrame(lazyLoop);
+            }
         }
 
         function onPointerMove(e) {
@@ -552,10 +534,16 @@ app.registerExtension({
                 e.preventDefault();
                 e.stopPropagation();
                 const pos = clampToImage(toImageCoords(e));
-                drawCtx.lineTo(pos.x, pos.y);
-                drawCtx.stroke();
-                state.lastBrushPoint = pos;
-                redraw();
+                if (state.lazyEnabled && state.tool === "brush") {
+                    // Lazy mode: update cursor target only; RAF loop does the drawing
+                    state._lazyCursorX = pos.x;
+                    state._lazyCursorY = pos.y;
+                } else {
+                    drawCtx.lineTo(pos.x, pos.y);
+                    drawCtx.stroke();
+                    state.lastBrushPoint = pos;
+                    redraw();
+                }
                 return;
             }
 
@@ -573,8 +561,35 @@ app.registerExtension({
             }
         }
 
+        // ── Lazy mouse RAF loop ──
+        function lazyLoop() {
+            if (!state._lazyActive) return;
+            const radius = state.lazyRadius / state.zoom;
+            const dx = state._lazyCursorX - state._lazyX;
+            const dy = state._lazyCursorY - state._lazyY;
+            const dist = Math.sqrt(dx * dx + dy * dy);
+            if (dist > radius) {
+                state._lazyX += dx * (1 - radius / dist);
+                state._lazyY += dy * (1 - radius / dist);
+                const clamped = clampToImage({ x: state._lazyX, y: state._lazyY });
+                drawCtx.lineTo(clamped.x, clamped.y);
+                drawCtx.stroke();
+                state.lastBrushPoint = clamped;
+                redraw();
+            }
+            state._lazyRafId = requestAnimationFrame(lazyLoop);
+        }
+
         function onPointerUp(e) {
             if (mode === "draw") {
+                // Stop lazy loop if active
+                if (state._lazyActive) {
+                    state._lazyActive = false;
+                    if (state._lazyRafId) {
+                        cancelAnimationFrame(state._lazyRafId);
+                        state._lazyRafId = null;
+                    }
+                }
                 state.isDrawing = false;
                 drawCtx.closePath();
                 redraw();
@@ -641,6 +656,12 @@ app.registerExtension({
             e.preventDefault();
             onWheel(e);
         }, { capture: true, passive: false });
+
+        // Suppress context menu on canvas (right-click is used to end the line tool)
+        viewCanvas.addEventListener("contextmenu", (e) => {
+            e.preventDefault();
+            e.stopPropagation();
+        }, true);
 
         // ── Keyboard shortcuts ──
         function onKeyDown(e) {
@@ -864,18 +885,25 @@ app.registerExtension({
         }, 500);
 
         // ── Node resize handler ──
+        let _resizing = false;
         const origOnResize = node.onResize;
         node.onResize = function (size) {
             origOnResize?.apply(this, arguments);
-            if (state._bgImage) {
+            if (state._bgImage && !_resizing) {
                 const aspect = state.imageWidth / state.imageHeight;
                 const canvasDisplayH = Math.round(size[0] / aspect);
                 canvasWrapper.style.height = canvasDisplayH + "px";
                 state._minHeight = canvasDisplayH + 60;
+                // Force node height to maintain image aspect ratio
+                const targetH = canvasDisplayH + 160;
+                if (Math.abs(size[1] - targetH) > 2) {
+                    _resizing = true;
+                    node.setSize([size[0], targetH]);
+                    _resizing = false;
+                }
             }
             requestAnimationFrame(() => {
                 updateCanvasSize();
-                // Re-fit if zoom would show the image smaller than viewport
                 const vw = viewCanvas.width;
                 const vh = viewCanvas.height;
                 if (state._bgImage) {
