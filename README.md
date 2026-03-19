@@ -46,17 +46,14 @@ An interactive drawing and annotation canvas for ComfyUI. Load an image, paint c
 
 ## Installation
 
-### Option A — ComfyUI Manager (recommended)
-Search for **"Sketch Pad"** in ComfyUI Manager and click Install.
-
-### Option B — Manual
+### Option A — Manual
 ```bash
 cd ComfyUI/custom_nodes
 git clone https://github.com/MancDanny/Comfy_sketch.git
 ```
 Then restart ComfyUI.
 
-### Option C — Direct download
+### Option B — Direct download
 Download the ZIP from the [Releases](https://github.com/MancDanny/Comfy_sketch/releases) page, extract to `ComfyUI/custom_nodes/Comfy_sketch/`, restart ComfyUI.
 
 **No extra Python dependencies** — uses only `torch`, `numpy`, `Pillow`, and `folder_paths` (all included in ComfyUI).

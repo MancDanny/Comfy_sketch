@@ -12,8 +12,7 @@ class SketchPad:
     """
     Combined image loader + interactive drawing canvas.
     Load an image (from file or upstream IMAGE input), draw colored
-    annotations (R/G/B), and output the original image, annotated image,
-    and per-color masks.
+    annotations (R/G/B), and output the original image and annotated image.
     """
 
     @classmethod
